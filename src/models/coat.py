@@ -56,6 +56,121 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+class PWAM(nn.Module):
+    def __init__(self, dim, v_in_channels, l_in_channels, key_channels, value_channels, num_heads=0, dropout=0.0):
+        super(PWAM, self).__init__()
+        # input x shape: (B, H*W, dim)
+        self.vis_project = nn.Sequential(nn.Conv1d(dim, dim, 1, 1),  # the init function sets bias to 0 if bias is True
+                                         nn.GELU(),
+                                         nn.Dropout(dropout)
+                                        )
+
+        self.image_lang_att = SpatialImageLanguageAttention(v_in_channels,  # v_in
+                                                            l_in_channels,  # l_in
+                                                            key_channels,  # key
+                                                            value_channels,  # value
+                                                            out_channels=value_channels,  # out
+                                                            num_heads=num_heads)
+
+        self.project_mm = nn.Sequential(nn.Conv1d(value_channels, value_channels, 1, 1),
+                                        nn.GELU(),
+                                        nn.Dropout(dropout)
+                                        )
+
+    def forward(self, x, l, l_mask):
+        # input x shape: (B, dim, H, W)
+        x_shape = x.shape
+        x = torch.flatten(x, 2, 3)  # (B, dim, H*W)
+        x = x.permute(0, 2, 1)      # (B, H*W, dim)
+
+        # input x shape: (B, H*W, dim)
+        vis = self.vis_project(x.permute(0, 2, 1))  # (B, dim, H*W)
+
+        lang = self.image_lang_att(x, l, l_mask)  # (B, H*W, dim)
+
+        lang = lang.permute(0, 2, 1)  # (B, dim, H*W)
+
+        mm = torch.mul(vis, lang)
+        mm = self.project_mm(mm)  # (B, dim, H*W)
+
+        mm = mm.permute(0, 2, 1)  # (B, H*W, dim)
+
+        return mm
+
+
+class SpatialImageLanguageAttention(nn.Module):
+    def __init__(self, v_in_channels, l_in_channels, key_channels, value_channels, out_channels=None, num_heads=1):
+        super(SpatialImageLanguageAttention, self).__init__()
+        # x shape: (B, H*W, v_in_channels)
+        # l input shape: (B, l_in_channels, N_l)
+        # l_mask shape: (B, N_l, 1)
+        self.v_in_channels = v_in_channels
+        self.l_in_channels = l_in_channels
+        self.out_channels = out_channels
+        self.key_channels = key_channels
+        self.value_channels = value_channels
+        self.num_heads = num_heads
+        if out_channels is None:
+            self.out_channels = self.value_channels
+
+        # Keys: language features: (B, l_in_channels, #words)
+        # avoid any form of spatial normalization because a sentence contains many padding 0s
+        self.f_key = nn.Sequential(
+            nn.Conv1d(self.l_in_channels, self.key_channels, kernel_size=1, stride=1),
+        )
+
+        # Queries: visual features: (B, H*W, v_in_channels)
+        self.f_query = nn.Sequential(
+            nn.Conv1d(self.v_in_channels, self.key_channels, kernel_size=1, stride=1),
+            nn.InstanceNorm1d(self.key_channels),
+        )
+
+        # Values: language features: (B, l_in_channels, #words)
+        self.f_value = nn.Sequential(
+            nn.Conv1d(self.l_in_channels, self.value_channels, kernel_size=1, stride=1),
+        )
+
+        # Out projection
+        self.W = nn.Sequential(
+            nn.Conv1d(self.value_channels, self.out_channels, kernel_size=1, stride=1),
+            nn.InstanceNorm1d(self.out_channels),
+        )
+
+    def forward(self, x, l, l_mask):
+        # x shape: (B, H*W, v_in_channels)
+        # l input shape: (B, l_in_channels, N_l)
+        # l_mask shape: (B, N_l, 1)
+        B, HW = x.size(0), x.size(1)
+        x = x.permute(0, 2, 1)  # (B, key_channels, H*W)
+        l_mask = l_mask.permute(0, 2, 1)  # (B, N_l, 1) -> (B, 1, N_l)
+
+        query = self.f_query(x)  # (B, key_channels, H*W) if Conv1D
+        query = query.permute(0, 2, 1)  # (B, H*W, key_channels)
+        key = self.f_key(l)  # (B, key_channels, N_l)
+        value = self.f_value(l)  # (B, self.value_channels, N_l)
+        key = key * l_mask  # (B, key_channels, N_l)
+        value = value * l_mask  # (B, self.value_channels, N_l)
+        n_l = value.size(-1)
+        query = query.reshape(B, HW, self.num_heads, self.key_channels//self.num_heads).permute(0, 2, 1, 3)
+        # (b, num_heads, H*W, self.key_channels//self.num_heads)
+        key = key.reshape(B, self.num_heads, self.key_channels//self.num_heads, n_l)
+        # (b, num_heads, self.key_channels//self.num_heads, n_l)
+        value = value.reshape(B, self.num_heads, self.value_channels//self.num_heads, n_l)
+        # # (b, num_heads, self.value_channels//self.num_heads, n_l)
+        l_mask = l_mask.unsqueeze(1)  # (b, 1, 1, n_l)
+
+        sim_map = torch.matmul(query, key)  # (B, self.num_heads, H*W, N_l)
+        sim_map = (self.key_channels ** -.5) * sim_map  # scaled dot product
+
+        sim_map = sim_map + (1e4*l_mask - 1e4)  # assign a very small number to padding positions
+        sim_map = F.softmax(sim_map, dim=-1)  # (B, num_heads, h*w, N_l)
+        out = torch.matmul(sim_map, value.permute(0, 1, 3, 2))  # (B, num_heads, H*W, self.value_channels//num_heads)
+        out = out.permute(0, 2, 1, 3).contiguous().reshape(B, HW, self.value_channels)  # (B, H*W, value_channels)
+        out = out.permute(0, 2, 1)  # (B, value_channels, HW)
+        out = self.W(out)  # (B, value_channels, HW)
+        out = out.permute(0, 2, 1)  # (B, HW, value_channels)
+
+        return out
 
 class ConvRelPosEnc(nn.Module):
     """ Convolutional relative position encoding. """
@@ -383,6 +498,64 @@ class CoaT(nn.Module):
 
         # Enable stochastic depth.
         dpr = drop_path_rate
+
+        # fuse before downsampling
+        self.fusion1 = PWAM(embed_dims[0],# both the visual input and for combining, num of channels
+                            embed_dims[0],  # v_in
+                            768,  # l_in
+                            embed_dims[0],  # key
+                            embed_dims[0],  # value
+                            num_heads=1,
+                            dropout=0)
+
+        self.res_gate1 = nn.Sequential(
+            nn.Linear(embed_dims[0], embed_dims[0], bias=False),
+            nn.ReLU(),
+            nn.Linear(embed_dims[0], embed_dims[0], bias=False),
+            nn.Tanh()
+        )
+        self.fusion2 = PWAM(embed_dims[1],# both the visual input and for combining, num of channels
+                            embed_dims[1],  # v_in
+                            768,  # l_in
+                            embed_dims[1],  # key
+                            embed_dims[1],  # value
+                            num_heads=1,
+                            dropout=0)
+
+        self.res_gate2 = nn.Sequential(
+            nn.Linear(embed_dims[1], embed_dims[1], bias=False),
+            nn.ReLU(),
+            nn.Linear(embed_dims[1], embed_dims[1], bias=False),
+            nn.Tanh()
+        )
+        self.fusion3 = PWAM(embed_dims[2],# both the visual input and for combining, num of channels
+                            embed_dims[2],  # v_in
+                            768,  # l_in
+                            embed_dims[2],  # key
+                            embed_dims[2],  # value
+                            num_heads=1,
+                            dropout=0)
+
+        self.res_gate3 = nn.Sequential(
+            nn.Linear(embed_dims[2], embed_dims[2], bias=False),
+            nn.ReLU(),
+            nn.Linear(embed_dims[2], embed_dims[2], bias=False),
+            nn.Tanh()
+        )
+        self.fusion4 = PWAM(embed_dims[3],# both the visual input and for combining, num of channels
+                            embed_dims[3],  # v_in
+                            768,  # l_in
+                            embed_dims[3],  # key
+                            embed_dims[3],  # value
+                            num_heads=1,
+                            dropout=0)
+
+        self.res_gate4 = nn.Sequential(
+            nn.Linear(embed_dims[3], embed_dims[3], bias=False),
+            nn.ReLU(),
+            nn.Linear(embed_dims[3], embed_dims[3], bias=False),
+            nn.Tanh()
+        )
         
         # Serial blocks 1.
         self.serial_blocks1 = nn.ModuleList([
@@ -488,7 +661,7 @@ class CoaT(nn.Module):
         """ Remove CLS token. """
         return x[:, 1:, :]
 
-    def forward_features(self, x0):
+    def forward_features(self, x0, l, l_mask):
         B = x0.shape[0]
 
         # Serial blocks 1.
@@ -498,6 +671,9 @@ class CoaT(nn.Module):
             x1 = blk(x1, size=(H1, W1))
         x1_nocls = self.remove_cls(x1)
         x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
+        x1_shape = x1_nocls.shape
+        x1_residual = self.fusion1(x1_nocls, l, l_mask)
+        x1_nocls = x1_nocls + (self.res_gate1(x1_residual) * x1_residual).permute(0, 2, 1).reshape(x1_shape)
         
         # Serial blocks 2.
         x2, (H2, W2) = self.patch_embed2(x1_nocls)
@@ -506,6 +682,9 @@ class CoaT(nn.Module):
             x2 = blk(x2, size=(H2, W2))
         x2_nocls = self.remove_cls(x2)
         x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
+        x2_shape = x2_nocls.shape
+        x2_residual = self.fusion2(x2_nocls, l, l_mask)
+        x2_nocls = x2_nocls + (self.res_gate2(x2_residual) * x2_residual).permute(0, 2, 1).reshape(x2_shape)
 
         # Serial blocks 3.
         x3, (H3, W3) = self.patch_embed3(x2_nocls)
@@ -514,6 +693,9 @@ class CoaT(nn.Module):
             x3 = blk(x3, size=(H3, W3))
         x3_nocls = self.remove_cls(x3)
         x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
+        x3_shape = x3_nocls.shape
+        x3_residual = self.fusion3(x3_nocls, l, l_mask)
+        x3_nocls = x3_nocls + (self.res_gate3(x3_residual) * x3_residual).permute(0, 2, 1).reshape(x3_shape)
 
         # Serial blocks 4.
         x4, (H4, W4) = self.patch_embed4(x3_nocls)
@@ -522,66 +704,77 @@ class CoaT(nn.Module):
             x4 = blk(x4, size=(H4, W4))
         x4_nocls = self.remove_cls(x4)
         x4_nocls = x4_nocls.reshape(B, H4, W4, -1).permute(0, 3, 1, 2).contiguous()
+        x4_shape = x4_nocls.shape
+        x4_residual = self.fusion4(x4_nocls, l, l_mask)
+        #x4_nocls = x4_nocls + (self.res_gate4(x4_residual) * x4_residual).permute(0, 2, 1).reshape(x4_shape)
+        x1_residual = x1_residual.permute(0, 2, 1).reshape(x1_shape)
+        x2_residual = x2_residual.permute(0, 2, 1).reshape(x2_shape)
+        x3_residual = x3_residual.permute(0, 2, 1).reshape(x3_shape)
+        x4_residual = x4_residual.permute(0, 2, 1).reshape(x4_shape)
 
-        # Only serial blocks: Early return.
-        if self.parallel_depth == 0:
-            if self.return_interm_layers:   # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
-                feat_out = {}   
-                if 'x1_nocls' in self.out_features:
-                    feat_out['x1_nocls'] = x1_nocls
-                if 'x2_nocls' in self.out_features:
-                    feat_out['x2_nocls'] = x2_nocls
-                if 'x3_nocls' in self.out_features:
-                    feat_out['x3_nocls'] = x3_nocls
-                if 'x4_nocls' in self.out_features:
-                    feat_out['x4_nocls'] = x4_nocls
-                return feat_out
-            else:                           # Return features for classification.
-                x4 = self.norm4(x4)
-                x4_cls = x4[:, 0]
-                return x4_cls
+        #return [x1_nocls, x2_nocls, x3_nocls, x4_nocls]
+        return [x1_residual, x2_residual, x3_residual, x4_residual]
 
-        # Parallel blocks.
-        for blk in self.parallel_blocks:
-            x1, x2, x3, x4 = blk(x1, x2, x3, x4, sizes=[(H1, W1), (H2, W2), (H3, W3), (H4, W4)])
+        #### Only serial blocks: Early return.
+        ###if self.parallel_depth == 0:
+        ###    if self.return_interm_layers:   # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
+        ###        feat_out = {}   
+        ###        if 'x1_nocls' in self.out_features:
+        ###            feat_out['x1_nocls'] = x1_nocls
+        ###        if 'x2_nocls' in self.out_features:
+        ###            feat_out['x2_nocls'] = x2_nocls
+        ###        if 'x3_nocls' in self.out_features:
+        ###            feat_out['x3_nocls'] = x3_nocls
+        ###        if 'x4_nocls' in self.out_features:
+        ###            feat_out['x4_nocls'] = x4_nocls
+        ###        return feat_out
+        ###    else:                           # Return features for classification.
+        ###        x4 = self.norm4(x4)
+        ###        x4_cls = x4[:, 0]
+        ###        return x4_cls
 
-        if self.return_interm_layers:       # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
-            feat_out = {}   
-            if 'x1_nocls' in self.out_features:
-                x1_nocls = self.remove_cls(x1)
-                x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x1_nocls'] = x1_nocls
-            if 'x2_nocls' in self.out_features:
-                x2_nocls = self.remove_cls(x2)
-                x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x2_nocls'] = x2_nocls
-            if 'x3_nocls' in self.out_features:
-                x3_nocls = self.remove_cls(x3)
-                x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x3_nocls'] = x3_nocls
-            if 'x4_nocls' in self.out_features:
-                x4_nocls = self.remove_cls(x4)
-                x4_nocls = x4_nocls.reshape(B, H4, W4, -1).permute(0, 3, 1, 2).contiguous()
-                feat_out['x4_nocls'] = x4_nocls
-            return feat_out
-        else:
-            x2 = self.norm2(x2)
-            x3 = self.norm3(x3)
-            x4 = self.norm4(x4)
-            x2_cls = x2[:, :1]              # Shape: [B, 1, C].
-            x3_cls = x3[:, :1]
-            x4_cls = x4[:, :1]
-            merged_cls = torch.cat((x2_cls, x3_cls, x4_cls), dim=1)       # Shape: [B, 3, C].
-            merged_cls = self.aggregate(merged_cls).squeeze(dim=1)        # Shape: [B, C].
-            return merged_cls
+        #### Parallel blocks.
+        ###for blk in self.parallel_blocks:
+        ###    x1, x2, x3, x4 = blk(x1, x2, x3, x4, sizes=[(H1, W1), (H2, W2), (H3, W3), (H4, W4)])
 
-    def forward(self, x):
-        if self.return_interm_layers:       # Return intermediate features (for down-stream tasks).
-            return self.forward_features(x)
-        else:                               # Return features for classification.
-            x = self.forward_features(x) 
-            x = self.head(x)
-            return x
+        ###if self.return_interm_layers:       # Return intermediate features for down-stream tasks (e.g. Deformable DETR and Detectron2).
+        ###    feat_out = {}   
+        ###    if 'x1_nocls' in self.out_features:
+        ###        x1_nocls = self.remove_cls(x1)
+        ###        x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
+        ###        feat_out['x1_nocls'] = x1_nocls
+        ###    if 'x2_nocls' in self.out_features:
+        ###        x2_nocls = self.remove_cls(x2)
+        ###        x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
+        ###        feat_out['x2_nocls'] = x2_nocls
+        ###    if 'x3_nocls' in self.out_features:
+        ###        x3_nocls = self.remove_cls(x3)
+        ###        x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
+        ###        feat_out['x3_nocls'] = x3_nocls
+        ###    if 'x4_nocls' in self.out_features:
+        ###        x4_nocls = self.remove_cls(x4)
+        ###        x4_nocls = x4_nocls.reshape(B, H4, W4, -1).permute(0, 3, 1, 2).contiguous()
+        ###        feat_out['x4_nocls'] = x4_nocls
+        ###    return feat_out
+        ###else:
+        ###    x2 = self.norm2(x2)
+        ###    x3 = self.norm3(x3)
+        ###    x4 = self.norm4(x4)
+        ###    x2_cls = x2[:, :1]              # Shape: [B, 1, C].
+        ###    x3_cls = x3[:, :1]
+        ###    x4_cls = x4[:, :1]
+        ###    merged_cls = torch.cat((x2_cls, x3_cls, x4_cls), dim=1)       # Shape: [B, 3, C].
+        ###    merged_cls = self.aggregate(merged_cls).squeeze(dim=1)        # Shape: [B, C].
+        ###    return merged_cls
+
+    def forward(self, x, l, l_mask):
+        #if self.return_interm_layers:       # Return intermediate features (for down-stream tasks).
+        #    return self.forward_features(x, l, l_mask)
+        #else:                               # Return features for classification.
+        #    x = self.forward_features(x, l, l_mask) 
+        #    x = self.head(x)
+        #    return x
+        return self.forward_features(x, l, l_mask)
 
 
 # CoaT.
