@@ -81,19 +81,19 @@ class PWAM(nn.Module):
         # input x shape: (B, dim, H, W)
         x_shape = x.shape
         x = torch.flatten(x, 2, 3)  # (B, dim, H*W)
-        x = x.permute(0, 2, 1)      # (B, H*W, dim)
+        x = x.permute(0, 2, 1).contiguous() # (B, H*W, dim)
 
         # input x shape: (B, H*W, dim)
-        vis = self.vis_project(x.permute(0, 2, 1))  # (B, dim, H*W)
+        vis = self.vis_project(x.permute(0, 2, 1).contiguous())  # (B, dim, H*W)
 
         lang = self.image_lang_att(x, l, l_mask)  # (B, H*W, dim)
 
-        lang = lang.permute(0, 2, 1)  # (B, dim, H*W)
+        lang = lang.permute(0, 2, 1).contiguous()  # (B, dim, H*W)
 
         mm = torch.mul(vis, lang)
         mm = self.project_mm(mm)  # (B, dim, H*W)
 
-        mm = mm.permute(0, 2, 1)  # (B, H*W, dim)
+        mm = mm.permute(0, 2, 1).contiguous()  # (B, H*W, dim)
 
         return mm
 
@@ -141,17 +141,17 @@ class SpatialImageLanguageAttention(nn.Module):
         # l input shape: (B, l_in_channels, N_l)
         # l_mask shape: (B, N_l, 1)
         B, HW = x.size(0), x.size(1)
-        x = x.permute(0, 2, 1)  # (B, key_channels, H*W)
-        l_mask = l_mask.permute(0, 2, 1)  # (B, N_l, 1) -> (B, 1, N_l)
+        x = x.permute(0, 2, 1).contiguous()  # (B, key_channels, H*W)
+        l_mask = l_mask.permute(0, 2, 1).contiguous()  # (B, N_l, 1) -> (B, 1, N_l)
 
         query = self.f_query(x)  # (B, key_channels, H*W) if Conv1D
-        query = query.permute(0, 2, 1)  # (B, H*W, key_channels)
+        query = query.permute(0, 2, 1).contiguous()  # (B, H*W, key_channels)
         key = self.f_key(l)  # (B, key_channels, N_l)
         value = self.f_value(l)  # (B, self.value_channels, N_l)
         key = key * l_mask  # (B, key_channels, N_l)
         value = value * l_mask  # (B, self.value_channels, N_l)
         n_l = value.size(-1)
-        query = query.reshape(B, HW, self.num_heads, self.key_channels//self.num_heads).permute(0, 2, 1, 3)
+        query = query.reshape(B, HW, self.num_heads, self.key_channels//self.num_heads).permute(0, 2, 1, 3).contiguous()
         # (b, num_heads, H*W, self.key_channels//self.num_heads)
         key = key.reshape(B, self.num_heads, self.key_channels//self.num_heads, n_l)
         # (b, num_heads, self.key_channels//self.num_heads, n_l)
@@ -164,11 +164,11 @@ class SpatialImageLanguageAttention(nn.Module):
 
         sim_map = sim_map + (1e4*l_mask - 1e4)  # assign a very small number to padding positions
         sim_map = F.softmax(sim_map, dim=-1)  # (B, num_heads, h*w, N_l)
-        out = torch.matmul(sim_map, value.permute(0, 1, 3, 2))  # (B, num_heads, H*W, self.value_channels//num_heads)
+        out = torch.matmul(sim_map, value.permute(0, 1, 3, 2).contiguous())  # (B, num_heads, H*W, self.value_channels//num_heads)
         out = out.permute(0, 2, 1, 3).contiguous().reshape(B, HW, self.value_channels)  # (B, H*W, value_channels)
-        out = out.permute(0, 2, 1)  # (B, value_channels, HW)
+        out = out.permute(0, 2, 1).contiguous()  # (B, value_channels, HW)
         out = self.W(out)  # (B, value_channels, HW)
-        out = out.permute(0, 2, 1)  # (B, HW, value_channels)
+        out = out.permute(0, 2, 1).contiguous()  # (B, HW, value_channels)
 
         return out
 
@@ -251,7 +251,7 @@ class FactorAtt_ConvRelPosEnc(nn.Module):
         B, N, C = x.shape
 
         # Generate Q, K, V.
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)  # Shape: [3, B, h, N, Ch].
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()  # Shape: [3, B, h, N, Ch].
         q, k, v = qkv[0], qkv[1], qkv[2]                                                 # Shape: [B, h, N, Ch].
 
         # Factorized attention.
@@ -264,7 +264,7 @@ class FactorAtt_ConvRelPosEnc(nn.Module):
 
         # Merge and reshape.
         x = self.scale * factor_att + crpe
-        x = x.transpose(1, 2).reshape(B, N, C)                                           # Shape: [B, h, N, Ch] -> [B, N, h, Ch] -> [B, N, C].
+        x = x.transpose(1, 2).contiguous().reshape(B, N, C)                                           # Shape: [B, h, N, Ch] -> [B, N, h, Ch] -> [B, N, C].
 
         # Output projection.
         x = self.proj(x)
@@ -290,9 +290,9 @@ class ConvPosEnc(nn.Module):
         cls_token, img_tokens = x[:, :1], x[:, 1:]                                       # Shape: [B, 1, C], [B, H*W, C].
         
         # Depthwise convolution.
-        feat = img_tokens.transpose(1, 2).view(B, C, H, W)
+        feat = img_tokens.transpose(1, 2).contiguous().view(B, C, H, W)
         x = self.proj(feat) + feat
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2).contiguous()
 
         # Combine with CLS token.
         x = torch.cat((cls_token, x), dim=1)
@@ -390,9 +390,9 @@ class ParallelBlock(nn.Module):
         cls_token  = x[:, :1, :]
         img_tokens = x[:, 1:, :]
         
-        img_tokens = img_tokens.transpose(1, 2).reshape(B, C, H, W)
+        img_tokens = img_tokens.transpose(1, 2).contiguous().reshape(B, C, H, W)
         img_tokens = F.interpolate(img_tokens, size=output_size, mode='bilinear')  # FIXME: May have alignment issue.
-        img_tokens = img_tokens.reshape(B, C, -1).transpose(1, 2)
+        img_tokens = img_tokens.reshape(B, C, -1).transpose(1, 2).contiguous()
         
         out = torch.cat((cls_token, img_tokens), dim=1)
 
@@ -453,7 +453,7 @@ class PatchEmbed(nn.Module):
         _, _, H, W = x.shape
         out_H, out_W = H // self.patch_size[0], W // self.patch_size[1]
 
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x).flatten(2).transpose(1, 2).contiguous()
         out = self.norm(x)
         
         return out, (out_H, out_W)
@@ -673,7 +673,7 @@ class CoaT(nn.Module):
         x1_nocls = x1_nocls.reshape(B, H1, W1, -1).permute(0, 3, 1, 2).contiguous()
         x1_shape = x1_nocls.shape
         x1_residual = self.fusion1(x1_nocls, l, l_mask)
-        x1_nocls = x1_nocls + (self.res_gate1(x1_residual) * x1_residual).permute(0, 2, 1).reshape(x1_shape)
+        x1_nocls = x1_nocls + (self.res_gate1(x1_residual) * x1_residual).permute(0, 2, 1).contiguous().reshape(x1_shape)
         
         # Serial blocks 2.
         x2, (H2, W2) = self.patch_embed2(x1_nocls)
@@ -684,7 +684,7 @@ class CoaT(nn.Module):
         x2_nocls = x2_nocls.reshape(B, H2, W2, -1).permute(0, 3, 1, 2).contiguous()
         x2_shape = x2_nocls.shape
         x2_residual = self.fusion2(x2_nocls, l, l_mask)
-        x2_nocls = x2_nocls + (self.res_gate2(x2_residual) * x2_residual).permute(0, 2, 1).reshape(x2_shape)
+        x2_nocls = x2_nocls + (self.res_gate2(x2_residual) * x2_residual).permute(0, 2, 1).contiguous().reshape(x2_shape)
 
         # Serial blocks 3.
         x3, (H3, W3) = self.patch_embed3(x2_nocls)
@@ -695,7 +695,7 @@ class CoaT(nn.Module):
         x3_nocls = x3_nocls.reshape(B, H3, W3, -1).permute(0, 3, 1, 2).contiguous()
         x3_shape = x3_nocls.shape
         x3_residual = self.fusion3(x3_nocls, l, l_mask)
-        x3_nocls = x3_nocls + (self.res_gate3(x3_residual) * x3_residual).permute(0, 2, 1).reshape(x3_shape)
+        x3_nocls = x3_nocls + (self.res_gate3(x3_residual) * x3_residual).permute(0, 2, 1).contiguous().reshape(x3_shape)
 
         # Serial blocks 4.
         x4, (H4, W4) = self.patch_embed4(x3_nocls)
@@ -707,10 +707,10 @@ class CoaT(nn.Module):
         x4_shape = x4_nocls.shape
         x4_residual = self.fusion4(x4_nocls, l, l_mask)
         #x4_nocls = x4_nocls + (self.res_gate4(x4_residual) * x4_residual).permute(0, 2, 1).reshape(x4_shape)
-        x1_residual = x1_residual.permute(0, 2, 1).reshape(x1_shape)
-        x2_residual = x2_residual.permute(0, 2, 1).reshape(x2_shape)
-        x3_residual = x3_residual.permute(0, 2, 1).reshape(x3_shape)
-        x4_residual = x4_residual.permute(0, 2, 1).reshape(x4_shape)
+        x1_residual = x1_residual.permute(0, 2, 1).contiguous().reshape(x1_shape)
+        x2_residual = x2_residual.permute(0, 2, 1).contiguous().reshape(x2_shape)
+        x3_residual = x3_residual.permute(0, 2, 1).contiguous().reshape(x3_shape)
+        x4_residual = x4_residual.permute(0, 2, 1).contiguous().reshape(x4_shape)
 
         #return [x1_nocls, x2_nocls, x3_nocls, x4_nocls]
         return [x1_residual, x2_residual, x3_residual, x4_residual]
